@@ -97,6 +97,7 @@ class ClientSession(
         list_roots_callback: ListRootsFnT | None = None,
         logging_callback: LoggingFnT | None = None,
         message_handler: MessageHandlerFnT | None = None,
+        oltp_endpoint: str = "",
     ) -> None:
         super().__init__(
             read_stream,
@@ -104,6 +105,7 @@ class ClientSession(
             types.ServerRequest,
             types.ServerNotification,
             read_timeout_seconds=read_timeout_seconds,
+            oltp_endpoint=oltp_endpoint,
         )
         self._sampling_callback = sampling_callback or _default_sampling_callback
         self._list_roots_callback = list_roots_callback or _default_list_roots_callback

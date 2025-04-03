@@ -73,6 +73,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from typing import Any, Generic, TypeVar
 
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
 import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from pydantic import AnyUrl
@@ -479,11 +481,12 @@ class Server(Generic[LifespanResultT]):
         # but also make tracing exceptions much easier during testing and when using
         # in-process servers.
         raise_exceptions: bool = False,
+        oltp_endpoint: str = "",
     ):
         async with AsyncExitStack() as stack:
             lifespan_context = await stack.enter_async_context(self.lifespan(self))
             session = await stack.enter_async_context(
-                ServerSession(read_stream, write_stream, initialization_options)
+                ServerSession(read_stream, write_stream, initialization_options, oltp_endpoint)
             )
 
             async with anyio.create_task_group() as tg:
@@ -531,45 +534,52 @@ class Server(Generic[LifespanResultT]):
         lifespan_context: LifespanResultT,
         raise_exceptions: bool,
     ):
-        logger.info(f"Processing request of type {type(req).__name__}")
-        if type(req) in self.request_handlers:
-            handler = self.request_handlers[type(req)]
-            logger.debug(f"Dispatching request of type {type(req).__name__}")
+        logger.info(f"Processing request of type {type(req).__name__}, {req.params}")
 
-            token = None
-            try:
-                # Set our global state that can be retrieved via
-                # app.get_request_context()
-                token = request_ctx.set(
-                    RequestContext(
-                        message.request_id,
-                        message.request_meta,
-                        session,
-                        lifespan_context,
+        carrier = {'traceparent': req.params.meta.traceparent}
+        ctx = TraceContextTextMapPropagator().extract(carrier=carrier)
+        with session.tracer.start_as_current_span(f"{type(req).__name__}", context=ctx) as span:
+            span.set_attribute("request_name", f"{type(req).__name__}")
+            span.set_attribute("request_body", f"{req}")
+
+            if type(req) in self.request_handlers:
+                handler = self.request_handlers[type(req)]
+                logger.info(f"Dispatching request of type {type(req).__name__}")
+
+                token = None
+                try:
+                    # Set our global state that can be retrieved via
+                    # app.get_request_context()
+                    token = request_ctx.set(
+                        RequestContext(
+                            message.request_id,
+                            message.request_meta,
+                            session,
+                            lifespan_context,
+                        )
+                    )
+                    response = await handler(req)
+                except McpError as err:
+                    response = err.error
+                except Exception as err:
+                    if raise_exceptions:
+                        raise err
+                    response = types.ErrorData(code=0, message=str(err), data=None)
+                finally:
+                    # Reset the global state after we are done
+                    if token is not None:
+                        request_ctx.reset(token)
+
+                await message.respond(response)
+            else:
+                await message.respond(
+                    types.ErrorData(
+                        code=types.METHOD_NOT_FOUND,
+                        message="Method not found",
                     )
                 )
-                response = await handler(req)
-            except McpError as err:
-                response = err.error
-            except Exception as err:
-                if raise_exceptions:
-                    raise err
-                response = types.ErrorData(code=0, message=str(err), data=None)
-            finally:
-                # Reset the global state after we are done
-                if token is not None:
-                    request_ctx.reset(token)
 
-            await message.respond(response)
-        else:
-            await message.respond(
-                types.ErrorData(
-                    code=types.METHOD_NOT_FOUND,
-                    message="Method not found",
-                )
-            )
-
-        logger.debug("Response sent")
+            logger.debug("Response sent")
 
     async def _handle_notification(self, notify: Any):
         if type(notify) in self.notification_handlers:

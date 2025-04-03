@@ -5,6 +5,16 @@ from datetime import timedelta
 from types import TracebackType
 from typing import Any, Generic, TypeVar
 
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import (
+    BatchSpanProcessor,
+    SimpleSpanProcessor,
+)
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter as GRPCExporter
+from opentelemetry.sdk.trace.export import ConsoleSpanExporter
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
 import anyio
 import anyio.lowlevel
 import httpx
@@ -178,6 +188,7 @@ class BaseSession(
         receive_notification_type: type[ReceiveNotificationT],
         # If none, reading will never time out
         read_timeout_seconds: timedelta | None = None,
+        oltp_endpoint: str = "",
     ) -> None:
         self._read_stream = read_stream
         self._write_stream = write_stream
@@ -189,6 +200,14 @@ class BaseSession(
         self._in_flight = {}
 
         self._exit_stack = AsyncExitStack()
+
+        trace.set_tracer_provider(TracerProvider())
+        self.tracer = trace.get_tracer_provider().get_tracer(__name__)
+        if oltp_endpoint != "":
+            grpc_exporter = GRPCExporter(endpoint=oltp_endpoint, insecure=True)
+            trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(grpc_exporter))
+        else:
+            trace.get_tracer_provider().add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
 
     async def __aenter__(self) -> Self:
         self._task_group = anyio.create_task_group()
@@ -221,51 +240,63 @@ class BaseSession(
         Do not use this method to emit notifications! Use send_notification()
         instead.
         """
+        with self.tracer.start_as_current_span(f"{request.__class__.__name__}") as span:
 
-        request_id = self._request_id
-        self._request_id = request_id + 1
+            request_id = self._request_id
+            self._request_id = request_id + 1
 
-        response_stream, response_stream_reader = anyio.create_memory_object_stream[
-            JSONRPCResponse | JSONRPCError
-        ](1)
-        self._response_streams[request_id] = response_stream
+            response_stream, response_stream_reader = anyio.create_memory_object_stream[
+                JSONRPCResponse | JSONRPCError
+            ](1)
+            self._response_streams[request_id] = response_stream
 
-        self._exit_stack.push_async_callback(lambda: response_stream.aclose())
-        self._exit_stack.push_async_callback(lambda: response_stream_reader.aclose())
+            self._exit_stack.push_async_callback(lambda: response_stream.aclose())
+            self._exit_stack.push_async_callback(lambda: response_stream_reader.aclose())
 
-        jsonrpc_request = JSONRPCRequest(
-            jsonrpc="2.0",
-            id=request_id,
-            **request.model_dump(by_alias=True, mode="json", exclude_none=True),
-        )
+            headers = {}
+            ctx = trace.set_span_in_context(span)
+            TraceContextTextMapPropagator().inject(headers, ctx)
 
-        # TODO: Support progress callbacks
-
-        await self._write_stream.send(JSONRPCMessage(jsonrpc_request))
-
-        try:
-            with anyio.fail_after(
-                None
-                if self._read_timeout_seconds is None
-                else self._read_timeout_seconds.total_seconds()
-            ):
-                response_or_error = await response_stream_reader.receive()
-        except TimeoutError:
-            raise McpError(
-                ErrorData(
-                    code=httpx.codes.REQUEST_TIMEOUT,
-                    message=(
-                        f"Timed out while waiting for response to "
-                        f"{request.__class__.__name__}. Waited "
-                        f"{self._read_timeout_seconds} seconds."
-                    ),
-                )
+            jsonrpc_request = JSONRPCRequest(
+                jsonrpc="2.0",
+                id=request_id,
+                **request.model_dump(by_alias=True, mode="json", exclude_none=True),
             )
+            if jsonrpc_request.params is None:
+                jsonrpc_request.params = {}
+            jsonrpc_request.params["_meta"] = {'traceparent': headers['traceparent']}
 
-        if isinstance(response_or_error, JSONRPCError):
-            raise McpError(response_or_error.error)
-        else:
-            return result_type.model_validate(response_or_error.result)
+            span.set_attribute("request", str(request))
+            span.set_attribute("Id", str(request_id))
+            span.set_attribute("request_name", f"{request.__class__.__name__}")
+
+            # TODO: Support progress callbacks
+
+            await self._write_stream.send(JSONRPCMessage(jsonrpc_request))
+
+            try:
+                with anyio.fail_after(
+                    None
+                    if self._read_timeout_seconds is None
+                    else self._read_timeout_seconds.total_seconds()
+                ):
+                    response_or_error = await response_stream_reader.receive()
+            except TimeoutError:
+                raise McpError(
+                    ErrorData(
+                        code=httpx.codes.REQUEST_TIMEOUT,
+                        message=(
+                            f"Timed out while waiting for response to "
+                            f"{request.__class__.__name__}. Waited "
+                            f"{self._read_timeout_seconds} seconds."
+                        ),
+                    )
+                )
+
+            if isinstance(response_or_error, JSONRPCError):
+                raise McpError(response_or_error.error)
+            else:
+                return result_type.model_validate(response_or_error.result)
 
     async def send_notification(self, notification: SendNotificationT) -> None:
         """

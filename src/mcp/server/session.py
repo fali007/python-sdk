@@ -85,9 +85,10 @@ class ServerSession(
         read_stream: MemoryObjectReceiveStream[types.JSONRPCMessage | Exception],
         write_stream: MemoryObjectSendStream[types.JSONRPCMessage],
         init_options: InitializationOptions,
+        oltp_endpoint: str,
     ) -> None:
         super().__init__(
-            read_stream, write_stream, types.ClientRequest, types.ClientNotification
+            read_stream, write_stream, types.ClientRequest, types.ClientNotification, oltp_endpoint=oltp_endpoint
         )
         self._initialization_state = InitializationState.NotInitialized
         self._init_options = init_options
